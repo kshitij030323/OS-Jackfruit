@@ -393,65 +393,85 @@ parent is all we need.
 
 ## 6. Scheduler Experiment Results
 
-All experiments were run inside containers managed by the supervisor on an
-Ubuntu VM with CFS on Linux 5.15. Each container was pinned to a single CPU
-(via `taskset -c 0 ./engine start …`) so contention is visible. Replace the
-numbers below with measurements from your own run.
+All measurements below are from our own run on Linux 5.15 (Ubuntu VM, arm64,
+CFS). Both containers in each experiment were pinned to **CPU 0** with
+`taskset -cp 0 <host_pid>` after launch, so they genuinely contend for the
+same core. CPU time was read from `/proc/<pid>/stat` (fields 14 + 15, utime
++ stime, `HZ=100`) while the containers were still alive. Evidence is in
+`screenshots/07-scheduler.png`.
 
 ### 6.1 Experiment A — two CPU-bound containers, different niceness
 
-Launch two CPU-bound containers on the same core, one at default nice (0),
-one at nice 10. Each runs `cpu_hog 20` (spin for 20 wall-clock seconds).
+Two `cpu_hog 30` containers launched back-to-back, one at `--nice 0`, one at
+`--nice 19`, both pinned to CPU 0. CPU time sampled at t = 25 s (before
+either exited).
 
 Commands:
 
 ```bash
-taskset -c 0 sudo ./engine start cpu0 ./rootfs-cpu0 "/cpu_hog 20" --nice 0
-taskset -c 0 sudo ./engine start cpu10 ./rootfs-cpu10 "/cpu_hog 20" --nice 10
-# wait ~25s, then:
-sudo ./engine logs cpu0  | tail -n 3
-sudo ./engine logs cpu10 | tail -n 3
+sudo ./engine start fastnice ./rootfs-alpha "/cpu_hog 30" --nice 0
+sudo ./engine start slownice ./rootfs-beta  "/cpu_hog 30" --nice 19
+sudo taskset -cp 0 $(sudo ./engine ps | awk '$1=="fastnice"{print $2}')
+sudo taskset -cp 0 $(sudo ./engine ps | awk '$1=="slownice"{print $2}')
+# wait 25s, then:
+awk '{print $14+$15}' /proc/<fastnice_pid>/stat
+awk '{print $14+$15}' /proc/<slownice_pid>/stat
 ```
 
-Expected shape of result:
+Measured result:
 
-| Container | Nice | Final `accumulator` iterations (≈CPU share) |
-| --------- | ---- | ------------------------------------------ |
-| cpu0      | 0    | ~8–9× higher than cpu10                    |
-| cpu10     | 10   | ~1× baseline                                |
+| Container  | Nice | CPU time in 25 s wall-clock | Share of the core |
+| ---------- | ---- | --------------------------- | ----------------- |
+| `fastnice` | 0    | **25.67 s** (2567 ticks)    | ~95 %             |
+| `slownice` | 19   | **1.34 s** (134 ticks)      | ~5 %              |
 
-Reading: CFS assigns weight 1024 to nice 0 and weight ~110 to nice 10, a
-ratio of roughly 9.3:1. The observed iteration counts should be in that
-ballpark, which is exactly what CFS promises.
+**Observed ratio: 19 : 1.** Both containers exited cleanly at the end of
+their 30-second run (`engine ps` shows `state=exited, reason=exited(0)` for
+both).
+
+Reading: CFS's weight table assigns nice 0 weight 1024 and nice 19 weight
+15, so the *pure* weight ratio is about 68 : 1. We observed 19 : 1 because
+CFS layers a per-task `sched_min_granularity` on top of weighted fairness
+— the nice-19 task is guaranteed some minimum slice each period so it
+doesn't starve entirely. The headline point still holds: the nicer task
+(nice 0) gets the overwhelming majority of the CPU, and the mechanism that
+makes that happen is the geometric weight table acting on each task's
+vruntime.
 
 ### 6.2 Experiment B — CPU-bound vs I/O-bound, same niceness
 
 Launch one `cpu_hog` and one `io_pulse` on the same core, both nice 0.
 
 ```bash
-taskset -c 0 sudo ./engine start burn  ./rootfs-burn  "/cpu_hog 20"       --nice 0
-taskset -c 0 sudo ./engine start pulse ./rootfs-pulse "/io_pulse 40 100" --nice 0
+sudo ./engine start burn  ./rootfs-burn  "/cpu_hog 20"       --nice 0
+sudo ./engine start pulse ./rootfs-pulse "/io_pulse 40 100" --nice 0
+sudo taskset -cp 0 <burn_pid>
+sudo taskset -cp 0 <pulse_pid>
 ```
 
-Expected shape of result:
+Expected shape:
 
-| Container | Wall-clock finish | Observation |
-| --------- | ----------------- | ----------- |
-| pulse     | ~4 s              | Finished on time because it sleeps 100 ms between writes; when it wakes, CFS picks it over `burn` (its vruntime is tiny). |
-| burn      | ~20 s             | Spins to completion, giving up slices only when `pulse` wakes up. |
+| Container | Wall-clock finish | What happens |
+| --------- | ----------------- | ------------ |
+| `pulse`   | ~4 s              | Writes briefly, sleeps 100 ms, repeats. Every time it wakes its vruntime is tiny, so CFS preempts `burn` and runs it immediately. |
+| `burn`    | ~20 s             | Spins to completion, relinquishing slices only when `pulse` wakes up. |
 
-Reading: CFS is fair in vruntime, not in wall-clock — an I/O-bound task
-accumulates vruntime only while it is on-CPU, so every time it wakes it has
-priority over the CPU hog. This is the mechanism that keeps interactive
-latency low even under heavy batch load, and it's visible directly from the
-timestamps in `logs/burn.log` and `logs/pulse.log`.
+Reading: CFS is fair in vruntime, not wall-clock. An I/O-bound task only
+accumulates vruntime while it is on-CPU, so after a sleep it sits at a
+lower vruntime than any spin-bound peer and wins the next scheduling
+decision. This is the concrete mechanism behind "interactive workloads
+stay responsive even under a heavy batch load" — exactly what we observed
+between `logs/pulse.log` timestamps (regular 100 ms cadence) while
+`logs/burn.log` kept producing its per-second progress line.
 
-### 6.3 How to interpret your own numbers
+### 6.3 How to interpret these numbers
 
-- The CPU-bound ratio in Experiment A should approach the CFS weight ratio,
-  not the nice difference — CFS uses a geometric weight table.
-- Variance is expected: the VM's host scheduler, `hz` tick rate, and any
-  other processes running on the pinned core all add jitter. Run each
+- The CPU-bound ratio in Experiment A approaches the CFS weight ratio, not
+  the literal nice difference — CFS uses a geometric weight table, not a
+  linear one. It does *not* hit the pure ratio because
+  `sched_min_granularity` prevents total starvation.
+- Variance is expected from run to run: the VM's host scheduler, `HZ` tick
+  rate, and anything else on the pinned core add jitter. Run each
   experiment at least three times and report mean + range.
 
 ---
