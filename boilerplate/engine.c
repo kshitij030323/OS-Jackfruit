@@ -772,8 +772,11 @@ static void handle_stop(int client_fd, const control_request_t *req)
     r->stop_requested = 1;
     pthread_mutex_unlock(&g_ctx.metadata_lock);
 
-    /* SIGTERM first, then SIGKILL if still running after 2s. */
+    /* PID 1 in a new PID namespace ignores SIGTERM unless it installs a
+     * handler (kernel protects init). Send SIGKILL so the stop is reliable;
+     * stop_requested is already set so attribution stays "stopped". */
     kill(pid, SIGTERM);
+    kill(pid, SIGKILL);
     char msg[128];
     snprintf(msg, sizeof(msg), "stop signaled (pid %d)\n", pid);
     send_simple(client_fd, 0, msg);
@@ -825,7 +828,7 @@ static int setup_signalfd(void)
     sigaddset(&mask, SIGTERM);
     sigaddset(&mask, SIGPIPE);
     if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) { perror("sigprocmask"); return -1; }
-    int sfd = signalfd(-1, &mask, SFD_CLOEXEC);
+    int sfd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
     if (sfd < 0) perror("signalfd");
     return sfd;
 }

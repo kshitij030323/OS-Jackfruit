@@ -1,0 +1,2 @@
+supervisor up. base-rootfs=./rootfs-base socket=/tmp/mini_runtime.sock
+supervisor: received signal 15, shutting down
